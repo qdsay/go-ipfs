@@ -41,12 +41,15 @@ var defaultKnownGateways = map[string]config.GatewaySpec{
 	"dweb.link":       subdomainGatewaySpec,
 }
 
+// Label's max length in DNS (https://tools.ietf.org/html/rfc1034#page-7)
+const dnsLabelMaxLength int = 63
+
 // HostnameOption rewrites an incoming request based on the Host header.
 func HostnameOption() ServeOption {
 	return func(n *core.IpfsNode, _ net.Listener, mux *http.ServeMux) (*http.ServeMux, error) {
 		childMux := http.NewServeMux()
 
-		coreApi, err := coreapi.NewCoreAPI(n)
+		coreAPI, err := coreapi.NewCoreAPI(n)
 		if err != nil {
 			return nil, err
 		}
@@ -94,7 +97,12 @@ func HostnameOption() ServeOption {
 					if gw.UseSubdomains {
 						// Yes, redirect if applicable
 						// Example: dweb.link/ipfs/{cid} → {cid}.ipfs.dweb.link
-						if newURL, ok := toSubdomainURL(r.Host, r.URL.Path, r); ok {
+						newURL, err := toSubdomainURL(r.Host, r.URL.Path, r)
+						if err != nil {
+							http.Error(w, err.Error(), http.StatusBadRequest)
+							return
+						}
+						if newURL != "" {
 							// Just to be sure single Origin can't be abused in
 							// web browsers that ignored the redirect for some
 							// reason, Clear-Site-Data header clears browsing
@@ -124,7 +132,7 @@ func HostnameOption() ServeOption {
 				// Not a whitelisted path
 
 				// Try DNSLink, if it was not explicitly disabled for the hostname
-				if !gw.NoDNSLink && isDNSLinkRequest(r.Context(), coreApi, r) {
+				if !gw.NoDNSLink && isDNSLinkRequest(n.Context(), coreAPI, r) {
 					// rewrite path and handle as DNSLink
 					r.URL.Path = "/ipns/" + stripPort(r.Host) + r.URL.Path
 					childMux.ServeHTTP(w, r)
@@ -151,14 +159,42 @@ func HostnameOption() ServeOption {
 					return
 				}
 
-				// Do we need to fix multicodec in PeerID represented as CIDv1?
-				if isPeerIDNamespace(ns) {
-					keyCid, err := cid.Decode(rootID)
-					if err == nil && keyCid.Type() != cid.Libp2pKey {
-						if newURL, ok := toSubdomainURL(hostname, pathPrefix+r.URL.Path, r); ok {
-							// Redirect to CID fixed inside of toSubdomainURL()
+				// Check if rootID is a valid CID
+				if rootCID, err := cid.Decode(rootID); err == nil {
+					// Do we need to redirect root CID to a canonical DNS representation?
+					dnsCID, err := toDNSPrefix(rootID, rootCID)
+					if err != nil {
+						http.Error(w, err.Error(), http.StatusBadRequest)
+						return
+					}
+					if !strings.HasPrefix(r.Host, dnsCID) {
+						dnsPrefix := "/" + ns + "/" + dnsCID
+						newURL, err := toSubdomainURL(hostname, dnsPrefix+r.URL.Path, r)
+						if err != nil {
+							http.Error(w, err.Error(), http.StatusBadRequest)
+							return
+						}
+						if newURL != "" {
+							// Redirect to deterministic CID to ensure CID
+							// always gets the same Origin on the web
 							http.Redirect(w, r, newURL, http.StatusMovedPermanently)
 							return
+						}
+					}
+
+					// Do we need to fix multicodec in PeerID represented as CIDv1?
+					if isPeerIDNamespace(ns) {
+						if rootCID.Type() != cid.Libp2pKey {
+							newURL, err := toSubdomainURL(hostname, pathPrefix+r.URL.Path, r)
+							if err != nil {
+								http.Error(w, err.Error(), http.StatusBadRequest)
+								return
+							}
+							if newURL != "" {
+								// Redirect to CID fixed inside of toSubdomainURL()
+								http.Redirect(w, r, newURL, http.StatusMovedPermanently)
+								return
+							}
 						}
 					}
 				}
@@ -176,7 +212,7 @@ func HostnameOption() ServeOption {
 			// 1. is wildcard DNSLink enabled (Gateway.NoDNSLink=false)?
 			// 2. does Host header include a fully qualified domain name (FQDN)?
 			// 3. does DNSLink record exist in DNS?
-			if !cfg.Gateway.NoDNSLink && isDNSLinkRequest(r.Context(), coreApi, r) {
+			if !cfg.Gateway.NoDNSLink && isDNSLinkRequest(n.Context(), coreAPI, r) {
 				// rewrite path and handle as DNSLink
 				r.URL.Path = "/ipns/" + stripPort(r.Host) + r.URL.Path
 				childMux.ServeHTTP(w, r)
@@ -266,18 +302,38 @@ func isPeerIDNamespace(ns string) bool {
 	}
 }
 
+// Converts an identifier to DNS-safe representation that fits in 63 characters
+func toDNSPrefix(rootID string, rootCID cid.Cid) (prefix string, err error) {
+	// Return as-is if things fit
+	if len(rootID) <= dnsLabelMaxLength {
+		return rootID, nil
+	}
+
+	// Convert to Base36 and see if that helped
+	rootID, err = cid.NewCidV1(rootCID.Type(), rootCID.Hash()).StringOfBase(mbase.Base36)
+	if err != nil {
+		return "", err
+	}
+	if len(rootID) <= dnsLabelMaxLength {
+		return rootID, nil
+	}
+
+	// Can't win with DNS at this point, return error
+	return "", fmt.Errorf("CID incompatible with DNS label length limit of 63: %s", rootID)
+}
+
 // Converts a hostname/path to a subdomain-based URL, if applicable.
-func toSubdomainURL(hostname, path string, r *http.Request) (redirURL string, ok bool) {
+func toSubdomainURL(hostname, path string, r *http.Request) (redirURL string, err error) {
 	var scheme, ns, rootID, rest string
 
 	query := r.URL.RawQuery
 	parts := strings.SplitN(path, "/", 4)
-	safeRedirectURL := func(in string) (out string, ok bool) {
+	safeRedirectURL := func(in string) (out string, err error) {
 		safeURI, err := url.ParseRequestURI(in)
 		if err != nil {
-			return "", false
+			return "", err
 		}
-		return safeURI.String(), true
+		return safeURI.String(), nil
 	}
 
 	// Support X-Forwarded-Proto if added by a reverse proxy
@@ -297,11 +353,11 @@ func toSubdomainURL(hostname, path string, r *http.Request) (redirURL string, ok
 		ns = parts[1]
 		rootID = parts[2]
 	default:
-		return "", false
+		return "", nil
 	}
 
 	if !isSubdomainNamespace(ns) {
-		return "", false
+		return "", nil
 	}
 
 	// add prefix if query is present
@@ -320,8 +376,8 @@ func toSubdomainURL(hostname, path string, r *http.Request) (redirURL string, ok
 	}
 
 	// If rootID is a CID, ensure it uses DNS-friendly text representation
-	if rootCid, err := cid.Decode(rootID); err == nil {
-		multicodec := rootCid.Type()
+	if rootCID, err := cid.Decode(rootID); err == nil {
+		multicodec := rootCID.Type()
 
 		// PeerIDs represented as CIDv1 are expected to have libp2p-key
 		// multicodec (https://github.com/libp2p/specs/pull/209).
@@ -334,11 +390,16 @@ func toSubdomainURL(hostname, path string, r *http.Request) (redirURL string, ok
 		// if object turns out to be a valid CID,
 		// ensure text representation used in subdomain is CIDv1 in Base32
 		// https://github.com/ipfs/in-web-browsers/issues/89
-		rootID, err = cid.NewCidV1(multicodec, rootCid.Hash()).StringOfBase(mbase.Base32)
+		rootCID = cid.NewCidV1(multicodec, rootCID.Hash())
+		rootID, err = rootCID.StringOfBase(mbase.Base32)
 		if err != nil {
-			// should not error, but if it does, its clealy not possible to
-			// produce a subdomain URL
-			return "", false
+			return "", err
+		}
+
+		// make sure CID fits in DNS label
+		rootID, err = toDNSPrefix(rootID, rootCID)
+		if err != nil {
+			return "", err
 		}
 	}
 
