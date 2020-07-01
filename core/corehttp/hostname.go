@@ -132,7 +132,7 @@ func HostnameOption() ServeOption {
 				// Not a whitelisted path
 
 				// Try DNSLink, if it was not explicitly disabled for the hostname
-				if !gw.NoDNSLink && isDNSLinkRequest(n.Context(), coreAPI, r) {
+				if !gw.NoDNSLink && isDNSLinkRequest(r.Context(), coreAPI, r) {
 					// rewrite path and handle as DNSLink
 					r.URL.Path = "/ipns/" + stripPort(r.Host) + r.URL.Path
 					childMux.ServeHTTP(w, r)
@@ -212,7 +212,7 @@ func HostnameOption() ServeOption {
 			// 1. is wildcard DNSLink enabled (Gateway.NoDNSLink=false)?
 			// 2. does Host header include a fully qualified domain name (FQDN)?
 			// 3. does DNSLink record exist in DNS?
-			if !cfg.Gateway.NoDNSLink && isDNSLinkRequest(n.Context(), coreAPI, r) {
+			if !cfg.Gateway.NoDNSLink && isDNSLinkRequest(r.Context(), coreAPI, r) {
 				// rewrite path and handle as DNSLink
 				r.URL.Path = "/ipns/" + stripPort(r.Host) + r.URL.Path
 				childMux.ServeHTTP(w, r)
@@ -387,16 +387,20 @@ func toSubdomainURL(hostname, path string, r *http.Request) (redirURL string, er
 			multicodec = cid.Libp2pKey
 		}
 
-		// if object turns out to be a valid CID,
-		// ensure text representation used in subdomain is CIDv1 in Base32
-		// https://github.com/ipfs/in-web-browsers/issues/89
+		// Ensure CID text representation used in subdomain is compatible
+		// with the way DNS and URIs are implemented in user agents.
+		//
+		// 1. Switch to CIDv1 and enable case-insensitive Base encoding
+		//    to avoid issues when user agent force-lowercases the hostname
+		//    before making the request
+		//    (https://github.com/ipfs/in-web-browsers/issues/89)
 		rootCID = cid.NewCidV1(multicodec, rootCID.Hash())
 		rootID, err = rootCID.StringOfBase(mbase.Base32)
 		if err != nil {
 			return "", err
 		}
-
-		// make sure CID fits in DNS label
+		// 2. Make sure CID fits in a DNS label, adjust encoding if needed
+		//    (https://github.com/ipfs/go-ipfs/issues/7318)
 		rootID, err = toDNSPrefix(rootID, rootCID)
 		if err != nil {
 			return "", err
